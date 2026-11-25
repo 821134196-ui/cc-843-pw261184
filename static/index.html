@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>事件处理运行时 · 合并 / 串行 / 退避 / 租户公平</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --axis:           #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --good:           #0ca30c;
+    --critical:       #d03b3b;
+    --warning:        #b97d00;
+    --series-1:       #2a78d6;  /* naive-fifo   (blue)   */
+    --series-2:       #1baf7a;  /* smart merged (aqua)   */
+    --series-3:       #eb6834;  /* tenant line  (orange) */
+    --series-4:       #6250d6;  /* tenant line  (violet) */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface-1:      #1a1a19;
+      --text-primary:   #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --axis:           #383835;
+      --border:         rgba(255,255,255,0.10);
+      --good:           #0ca30c;
+      --critical:       #e66767;
+      --warning:        #fab219;
+      --series-1:       #3987e5;
+      --series-2:       #199e70;
+      --series-3:       #d95926;
+      --series-4:       #9085e9;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 24px 64px; }
+  header h1 { font-size: 22px; margin: 0 0 6px; }
+  header p { color: var(--text-secondary); margin: 0 0 18px; max-width: 880px; }
+  .toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+             margin-bottom: 22px; }
+  button.run {
+    background: var(--series-1); color: #fff; border: 0;
+    padding: 10px 22px; border-radius: 8px; font-size: 14px; font-weight: 600;
+    cursor: pointer;
+  }
+  button.run:disabled { opacity: .55; cursor: default; }
+  .status { color: var(--text-secondary); }
+  .spinner {
+    width: 15px; height: 15px; border: 2px solid var(--grid);
+    border-top-color: var(--series-1); border-radius: 50%;
+    display: inline-block; vertical-align: -2px; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  section.card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 20px; margin-bottom: 18px;
+  }
+  section.card > h2 { font-size: 15px; margin: 0 0 4px; }
+  section.card > .sub { color: var(--text-muted); font-size: 12.5px; margin: 0 0 14px; }
+
+  .kpi-grid { display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+  .kpi { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .kpi .label { color: var(--text-muted); font-size: 12px; }
+  .kpi .vals { display: flex; gap: 10px; margin-top: 6px; align-items: baseline; }
+  .kpi .v { font-size: 20px; font-weight: 650; }
+  .kpi .v.naive { color: var(--series-1); }
+  .kpi .v.smart { color: var(--series-2); }
+  .kpi .delta { font-size: 12px; font-weight: 600; }
+  .delta.good { color: var(--good); }
+  .delta.bad  { color: var(--critical); }
+  .legend { display: flex; gap: 18px; font-size: 12.5px; color: var(--text-secondary);
+            margin-bottom: 8px; flex-wrap: wrap; }
+  .legend .swatch { width: 10px; height: 10px; border-radius: 3px;
+                    display: inline-block; margin-right: 6px; vertical-align: 0; }
+
+  .chart-grid { display: grid; gap: 18px;
+                 grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); }
+  .chart-box { position: relative; }
+  canvas { width: 100%; display: block; }
+  .tooltip {
+    position: absolute; pointer-events: none; z-index: 5;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px;
+    box-shadow: 0 6px 22px rgba(0,0,0,.14); display: none;
+    min-width: 130px;
+  }
+  .tooltip .tt-title { font-weight: 650; margin-bottom: 4px; }
+  .tooltip .tt-row { display: flex; justify-content: space-between; gap: 14px;
+                     color: var(--text-secondary); }
+  .tooltip .tt-row b { color: var(--text-primary); font-weight: 600;
+                       font-variant-numeric: tabular-nums; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 10px; text-align: right;
+           border-bottom: 1px solid var(--grid);
+           font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--text-muted); font-weight: 600; font-size: 12px; }
+  .checks { display: grid; gap: 8px;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .check { display: flex; gap: 8px; align-items: baseline; }
+  .check .icon { font-weight: 700; }
+  .check.pass .icon { color: var(--good); }
+  .check.fail .icon { color: var(--critical); }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px;
+          font-size: 12px; font-weight: 650; }
+  .pill.naive { background: color-mix(in srgb, var(--series-1) 14%, transparent);
+                color: var(--series-1); }
+  .pill.smart { background: color-mix(in srgb, var(--series-2) 16%, transparent);
+                color: var(--series-2); }
+  .mechanics { display: grid; gap: 10px;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .mechanic { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .mechanic h3 { margin: 0 0 6px; font-size: 13.5px; }
+  .mechanic p { margin: 0; color: var(--text-secondary); font-size: 12.5px; }
+  .hidden { display: none; }
+  .err { color: var(--critical); font-weight: 600; }
+  code { background: var(--grid); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="viz-root wrap">
+  <header>
+    <h1>轻量事件处理运行时：合并 · 按键串行 · 退避 · 租户公平</h1>
+    <p>
+      页面向后端注入<strong>同一份固定负载</strong>（一个持续风暴租户 + 三个健康租户，
+      含注入失败、退避重试、过期重投与永久故障死信），分别跑在
+      <span class="pill naive">naive-fifo 基线</span>与
+      <span class="pill smart">smart 合并+DRR</span> 两个运行时上，比较端到端处理延迟与队列积压。
+    </p>
+  </header>
+
+  <div class="toolbar">
+    <button class="run" id="runBtn">注入固定负载并运行对比</button>
+    <span class="status" id="status">尚未运行</span>
+  </div>
+
+  <div id="results" class="hidden">
+    <section class="card">
+      <h2>负载与运行配置</h2>
+      <p class="sub" id="workloadInfo"></p>
+    </section>
+
+    <section class="card">
+      <h2>关键指标对比</h2>
+      <p class="sub">每个卡片左为 naive-fifo，右为 smart；delta 为 smart 相对 naive 的变化（绿色为改善）。</p>
+      <div class="legend">
+        <span><span class="swatch" style="background:var(--series-1)"></span>naive-fifo 基线</span>
+        <span><span class="swatch" style="background:var(--series-2)"></span>smart 合并+DRR</span>
+      </div>
+      <div class="kpi-grid" id="kpis"></div>
+    </section>
+
+    <section class="card">
+      <h2>队列积压随时间</h2>
+      <p class="sub">采样间隔 50 ms。风暴下 naive 队列持续堆积，smart 通过同键合并把每对象的待处理更新压到 1 条。</p>
+      <div class="chart-grid">
+        <div class="chart-box">
+          <canvas id="backlogChart" height="280"></canvas>
+          <div class="tooltip" id="tt-backlog"></div>
+        </div>
+        <div class="chart-box">
+          <canvas id="tenantBacklogChart" height="280"></canvas>
+          <div class="tooltip" id="tt-tenant-backlog"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>处理延迟分布与租户公平</h2>
+      <p class="sub">延迟 = 入队到状态提交的端到端时间。健康租户的 p95 是“不被饿死”的直接证据。</p>
+      <div class="chart-grid">
+        <div class="chart-box">
+          <canvas id="latencyChart" height="280"></canvas>
+          <div class="tooltip" id="tt-latency"></div>
+        </div>
+        <div class="chart-box">
+          <canvas id="fairnessChart" height="280"></canvas>
+          <div class="tooltip" id="tt-fairness"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>正确性校验</h2>
+      <p class="sub">过期重试不得覆写新状态；死信只应来自确定性的永久故障键。</p>
+      <div class="checks" id="checks"></div>
+    </section>
+
+    <section class="card">
+      <h2>明细表（表格视图）</h2>
+      <table id="detailTable">
+        <thead><tr id="detailHead"></tr></thead>
+        <tbody id="detailBody"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>运行时机制</h2>
+    <p class="sub">四个机制各自解决的问题。</p>
+    <div class="mechanics">
+      <div class="mechanic">
+        <h3>① 队列合并（coalescing）</h3>
+        <p>每个 (租户, key) 只保留一个待处理槽位；同对象的连续更新就地合并，最新版本胜出、保留最早入队时间。风暴从“每更新占一槽”降为“每对象一槽”。</p>
+      </div>
+      <div class="mechanic">
+        <h3>② 按键串行（per-key serialization）</h3>
+        <p>同一 key 永远不会被两个 worker 并发处理，不同 key 仍可并行；避免乱序提交对同一对象的状态竞争。</p>
+      </div>
+      <div class="mechanic">
+        <h3>③ 指数退避（backoff + jitter）</h3>
+        <p>失败事件进入全局延迟堆，按 base·2ⁿ 加对称抖动退避；超过最大尝试次数进死信队列。已被新版本超越的失败尝试直接判过期，不再浪费重试。</p>
+      </div>
+      <div class="mechanic">
+        <h3>④ 租户公平（DRR + 并发上限）</h3>
+        <p>每租户独立 FIFO，Deficit Round Robin 按配额轮转调度，并限制单租户可占用的 worker 数；持续风暴无法饿死健康租户。</p>
+      </div>
+      <div class="mechanic">
+        <h3>⑤ 过期版本保护（version CAS）</h3>
+        <p>状态提交是版本号 compare-and-swap：重试的旧版本 ≤ 已提交版本时被拒绝（StaleVersionError），旧重试永远无法覆写新状态。</p>
+      </div>
+      <div class="mechanic">
+        <h3>⑥ 基线对照</h3>
+        <p>naive-fifo 共享同样的安全保证（串行、CAS、退避），但不合并、不做公平调度——用它量化前四个机制带来的收益。</p>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+"use strict";
+
+const css = name => getComputedStyle(document.querySelector(".viz-root"))
+                       .getPropertyValue(name).trim();
+const COLORS = () => ({
+  naive: css("--series-1"), smart: css("--series-2"),
+  s3: css("--series-3"), s4: css("--series-4"),
+  grid: css("--grid"), axis: css("--axis"),
+  muted: css("--text-muted"), ink: css("--text-primary"),
+  secondary: css("--text-secondary"), good: css("--good"),
+  critical: css("--critical"),
+});
+
+// ------------------------------------------------------------------ helpers
+function fmt(v, digits = 1) {
+  if (Math.abs(v) >= 1000) return v.toLocaleString("zh-CN", {maximumFractionDigits: 0});
+  return Number(v).toFixed(digits);
+}
+function pctDelta(smart, naive) {
+  if (naive === 0) return smart === 0 ? 0 : -100;
+  return (smart - naive) / naive * 100;
+}
+function setupCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = rect.width || canvas.parentElement.clientWidth - 40;
+  const h = 280;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.height = h + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return {ctx, w, h};
+}
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const exp = Math.floor(Math.log10(v));
+  const base = Math.pow(10, exp);
+  const m = v / base;
+  const step = m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10;
+  return step * base;
+}
+
+// A tiny line chart supporting multiple series + hover crosshair.
+function lineChart(canvas, tooltip, series, opts) {
+  const {ctx, w, h} = setupCanvas(canvas);
+  const C = COLORS();
+  const pad = {l: 48, r: 14, t: 14, b: 30};
+  const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+  const allY = series.flatMap(s => s.points.map(p => p.y));
+  const allX = series.flatMap(s => s.points.map(p => p.x));
+  const maxY = niceMax(Math.max(...allY, 1));
+  const minX = Math.min(...allX), maxX = Math.max(...allX);
+  const x = v => pad.l + (maxX === minX ? 0 : (v - minX) / (maxX - minX) * iw);
+  const y = v => pad.t + ih - v / maxY * ih;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+
+  // grid + y ticks
+  const ticks = 4;
+  for (let i = 0; i <= ticks; i++) {
+    const val = maxY / ticks * i, yy = y(val);
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke();
+    ctx.fillStyle = C.muted; ctx.textAlign = "right";
+    ctx.fillText(fmt(val, 0), pad.l - 7, yy);
+  }
+  // x ticks
+  const xTicks = 5;
+  ctx.textAlign = "center";
+  for (let i = 0; i <= xTicks; i++) {
+    const val = minX + (maxX - minX) / xTicks * i;
+    ctx.fillStyle = C.muted;
+    ctx.fillText(val.toFixed(1) + "s", x(val), h - pad.b + 14);
+  }
+  // axis baseline
+  ctx.strokeStyle = C.axis;
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + ih);
+  ctx.lineTo(w - pad.r, pad.t + ih); ctx.stroke();
+
+  // lines
+  for (const s of series) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    s.points.forEach((p, i) => {
+      const px = x(p.x), py = y(p.y);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.stroke();
+    // end-of-line direct label (identity is not color-alone)
+    const last = s.points[s.points.length - 1];
+    if (last) {
+      ctx.fillStyle = s.color; ctx.textAlign = "left";
+      ctx.fillText(s.label, x(last.x) + 6, y(last.y));
+    }
+  }
+
+  // hover layer
+  canvas.onmousemove = ev => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    if (mx < pad.l || mx > w - pad.r) { tooltip.style.display = "none"; return; }
+    const tVal = minX + (mx - pad.l) / iw * (maxX - minX);
+    // crosshair
+    ctx.save();
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = C.axis; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x(tVal), pad.t);
+    ctx.lineTo(x(tVal), pad.t + ih); ctx.stroke();
+    ctx.restore();
+    const rows = series.map(s => {
+      const nearest = s.points.reduce((a, b) =>
+        Math.abs(b.x - tVal) < Math.abs(a.x - tVal) ? b : a);
+      return {label: s.label, color: s.color, value: nearest.y, x: nearest.x};
+    });
+    tooltip.innerHTML =
+      `<div class="tt-title">t ≈ ${tVal.toFixed(2)} s</div>` +
+      rows.map(r =>
+        `<div class="tt-row"><span><span class="swatch" style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${r.color};margin-right:5px"></span>${r.label}</span><b>${opts.valueFmt(r.value)}</b></div>`
+      ).join("");
+    tooltip.style.display = "block";
+    const box = canvas.parentElement.getBoundingClientRect();
+    let left = ev.clientX - box.left + 14;
+    if (left + 170 > box.width) left = ev.clientX - box.left - 180;
+    tooltip.style.left = left + "px";
+    tooltip.style.top = (ev.clientY - box.top - 10) + "px";
+  };
+  canvas.onmouseleave = () => {
+    tooltip.style.display = "none";
+    lineChart(canvas, tooltip, series, opts); // repaint to clear crosshair
+  };
+}
+
+// Grouped bar chart with hover tooltips.
+function barChart(canvas, tooltip, groups, seriesDefs, opts) {
+  const {ctx, w, h} = setupCanvas(canvas);
+  const C = COLORS();
+  const pad = {l: 48, r: 14, t: 16, b: 46};
+  const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
+  const maxV = niceMax(Math.max(1,
+      ...groups.flatMap(g => g.values)));
+  const y = v => pad.t + ih - v / maxV * ih;
+  const groupW = iw / groups.length;
+  const barW = Math.min(26, groupW / (seriesDefs.length + 1.6));
+
+  ctx.font = "11px system-ui, sans-serif";
+  for (let i = 0; i <= 4; i++) {
+    const val = maxV / 4 * i, yy = y(val);
+    ctx.strokeStyle = C.grid;
+    ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke();
+    ctx.fillStyle = C.muted; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(fmt(val, 0), pad.l - 7, yy);
+  }
+  ctx.strokeStyle = C.axis;
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + ih);
+  ctx.lineTo(w - pad.r, pad.t + ih); ctx.stroke();
+
+  const hitBoxes = [];
+  groups.forEach((g, gi) => {
+    const cx = pad.l + groupW * (gi + 0.5);
+    const totalW = barW * seriesDefs.length + 2 * (seriesDefs.length - 1);
+    seriesDefs.forEach((sd, si) => {
+      const bx = cx - totalW / 2 + si * (barW + 2);
+      const bh = ih * g.values[si] / maxV;
+      ctx.fillStyle = sd.color;
+      // 4px rounded data-end, 2px surface gap handled by the +2 spacing
+      const r = Math.min(4, bh);
+      ctx.beginPath();
+      ctx.moveTo(bx, y(g.values[si]));
+      ctx.arcTo(bx + barW, y(g.values[si]), bx + barW, y(g.values[si]) + r, r);
+      ctx.lineTo(bx + barW, pad.t + ih);
+      ctx.lineTo(bx, pad.t + ih);
+      ctx.lineTo(bx, y(g.values[si]) + r);
+      ctx.arcTo(bx, y(g.values[si]), bx + r, y(g.values[si]), r);
+      ctx.fill();
+      hitBoxes.push({x: bx, y: y(g.values[si]), w: barW, h: Math.max(6, bh),
+                     group: g.label, series: sd.label, value: g.values[si],
+                     color: sd.color});
+    });
+    ctx.fillStyle = C.secondary; ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const label = g.label.length > 12 ? g.label.slice(0, 11) + "…" : g.label;
+    ctx.fillText(label, cx, pad.t + ih + 8);
+  });
+
+  canvas.onmousemove = ev => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    const hit = hitBoxes.find(b => mx >= b.x && mx <= b.x + b.w &&
+                                   my >= b.y && my <= b.y + b.h);
+    if (!hit) { tooltip.style.display = "none"; return; }
+    tooltip.innerHTML =
+      `<div class="tt-title">${hit.group}</div>
+       <div class="tt-row"><span><span class="swatch" style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${hit.color};margin-right:5px"></span>${hit.series}</span><b>${opts.valueFmt(hit.value)}</b></div>`;
+    tooltip.style.display = "block";
+    const box = canvas.parentElement.getBoundingClientRect();
+    let left = ev.clientX - box.left + 14;
+    if (left + 190 > box.width) left = ev.clientX - box.left - 200;
+    tooltip.style.left = left + "px";
+    tooltip.style.top = (ev.clientY - box.top - 10) + "px";
+  };
+  canvas.onmouseleave = () => { tooltip.style.display = "none"; };
+}
+
+// ------------------------------------------------------------------ render
+function renderKpis(naive, smart) {
+  const nm = naive.metrics, sm = smart.metrics;
+  const lowerBetter = [
+    ["平均延迟 (ms)", nm.latency_ms.mean, sm.latency_ms.mean, v => v.toFixed(2)],
+    ["p95 延迟 (ms)", nm.latency_ms.p95, sm.latency_ms.p95, v => v.toFixed(2)],
+    ["p99 延迟 (ms)", nm.latency_ms.p99, sm.latency_ms.p99, v => v.toFixed(2)],
+    ["峰值总积压", naive.backlog.peak_total, smart.backlog.peak_total, v => fmt(v, 0)],
+    ["平均总积压", naive.backlog.avg_total, smart.backlog.avg_total, v => fmt(v, 1)],
+  ];
+  const higherBetter = [
+    ["合并的冗余更新", nm.coalesced, sm.coalesced, v => fmt(v, 0)],
+  ];
+  const plain = [
+    ["成功处理", nm.processed, sm.processed, v => fmt(v, 0)],
+    ["过期版本丢弃", nm.stale_dropped, sm.stale_dropped, v => fmt(v, 0)],
+    ["重试次数", nm.retried, sm.retried, v => fmt(v, 0)],
+    ["死信", nm.dead_lettered, sm.dead_lettered, v => fmt(v, 0)],
+  ];
+  const tile = (label, a, b, f, direction) => {
+    const d = pctDelta(b, a);
+    const good = direction === "lower" ? d < 0 : direction === "higher" ? d > 0 : null;
+    const deltaHtml = good === null ? "" :
+      `<span class="delta ${good ? "good" : "bad"}">${d > 0 ? "+" : ""}${d.toFixed(0)}%</span>`;
+    return `<div class="kpi"><div class="label">${label}</div>
+      <div class="vals"><span class="v naive">${f(a)}</span>
+      <span style="color:var(--text-muted)">/</span>
+      <span class="v smart">${f(b)}</span>${deltaHtml}</div></div>`;
+  };
+  document.getElementById("kpis").innerHTML =
+    lowerBetter.map(([l, a, b, f]) => tile(l, a, b, f, "lower")).join("") +
+    higherBetter.map(([l, a, b, f]) => tile(l, a, b, f, "higher")).join("") +
+    plain.map(([l, a, b, f]) => tile(l, a, b, f, "none")).join("");
+}
+
+function renderChecks(naive, smart) {
+  const rows = [];
+  for (const run of [naive, smart]) {
+    const m = run.metrics;
+    const checks = [
+      ["队列完全排空", run.drained],
+      ["过期重试被版本 CAS 丢弃（≥1）", m.stale_dropped >= 1],
+      ["死信仅来自永久故障键（==1）", m.dead_lettered === 1],
+      ["无成功事件丢失", m.processed + m.stale_dropped + m.dead_lettered <= m.submitted],
+    ];
+    rows.push(`<div><strong><span class="pill ${run.label.includes("smart") ? "smart" : "naive"}">${run.label}</span></strong>` +
+      checks.map(([name, ok]) =>
+        `<div class="check ${ok ? "pass" : "fail"}"><span class="icon">${ok ? "✓" : "✗"}</span><span>${name}</span></div>`
+      ).join("") + `</div>`);
+  }
+  document.getElementById("checks").innerHTML = rows.join("");
+}
+
+function renderTable(naive, smart) {
+  const nm = naive.metrics, sm = smart.metrics;
+  document.getElementById("detailHead").innerHTML =
+    "<tr><th>指标</th><th>naive-fifo</th><th>smart 合并+DRR</th><th>smart 相对变化</th></tr>";
+  const rows = [
+    ["提交事件", nm.submitted, sm.submitted, 0],
+    ["成功处理", nm.processed, sm.processed, 0],
+    ["合并的冗余更新", nm.coalesced, sm.coalesced, 1],
+    ["重试次数", nm.retried, sm.retried, 0],
+    ["过期版本丢弃", nm.stale_dropped, sm.stale_dropped, 0],
+    ["死信", nm.dead_lettered, sm.dead_lettered, 0],
+    ["峰值排队积压", naive.backlog.peak_queued, smart.backlog.peak_queued, 0],
+    ["平均延迟 ms", nm.latency_ms.mean, sm.latency_ms.mean, 2],
+    ["p50 ms", nm.latency_ms.p50, sm.latency_ms.p50, 2],
+    ["p95 ms", nm.latency_ms.p95, sm.latency_ms.p95, 2],
+    ["p99 ms", nm.latency_ms.p99, sm.latency_ms.p99, 2],
+    ["最大延迟 ms", nm.latency_ms["max"], sm.latency_ms["max"], 2],
+  ];
+  document.getElementById("detailBody").innerHTML = rows.map(([name, a, b, dig]) => {
+    const d = pctDelta(b, a);
+    const cls = d < 0 ? "good" : d > 0 ? "bad" : "";
+    const f = v => dig === 0 ? fmt(v, 0) : Number(v).toFixed(dig);
+    return `<tr><td>${name}</td><td>${f(a)}</td><td>${f(b)}</td>
+      <td class="${cls}" style="font-weight:600">${d === 0 ? "—" : (d > 0 ? "+" : "") + d.toFixed(1) + "%"}</td></tr>`;
+  }).join("");
+}
+
+async function runBenchmark() {
+  const btn = document.getElementById("runBtn");
+  const status = document.getElementById("status");
+  btn.disabled = true;
+  status.innerHTML = '<span class="spinner"></span> 正在注入负载并运行两个运行时（约 15 秒）…';
+  try {
+    const resp = await fetch("/api/run");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const report = await resp.json();
+    renderReport(report);
+
+    status.textContent = "完成 ✓ 结果基于同一份固定负载，可重复运行复现。";
+  } catch (err) {
+    status.innerHTML = '<span class="err">运行失败：' + err.message + "</span>";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("runBtn").addEventListener("click", runBenchmark);
+
+// Cache the last report so a window resize only re-renders charts locally.
+let lastReport = null;
+function renderReport(report) {
+  lastReport = report;
+  document.getElementById("results").classList.remove("hidden");
+  const [naive, smart] = report.runs;
+  const C = COLORS();
+
+  document.getElementById("workloadInfo").textContent =
+    `事件 ${report.workload.events} 条 · 注入 ${report.workload.duration}s · ` +
+    `风暴突发 ${report.workload.burst_size} 连发/每 ${report.workload.burst_gap * 1000}ms · ` +
+    `健康租户间隔 ${report.workload.healthy_interval * 1000}ms · ` +
+    `${report.workload.workers} workers · 单事件处理成本 ${report.workload.handler_cost_ms}ms · ` +
+    `租户：${report.workload.tenants.join("、")}`;
+
+  renderKpis(naive, smart);
+  renderChecks(naive, smart);
+  renderTable(naive, smart);
+
+  const backlogSeries = [naive, smart].map((run, i) => ({
+    label: run.label,
+    color: i === 0 ? C.naive : C.smart,
+    points: run.backlog.series.map(s => ({x: s.t, y: s.total})),
+  }));
+  lineChart(document.getElementById("backlogChart"),
+            document.getElementById("tt-backlog"), backlogSeries,
+            {valueFmt: v => fmt(v, 0) + " 个事件"});
+
+  const tenants = report.workload.tenants;
+  const palette = [C.s3, C.s4, C.naive, C.smart];
+  const tbSeries = tenants.map((t, i) => ({
+    label: t, color: palette[i % palette.length],
+    points: smart.backlog.series.map(s => ({
+      x: s.t, y: s.per_tenant[t] || 0,
+    })),
+  }));
+  lineChart(document.getElementById("tenantBacklogChart"),
+            document.getElementById("tt-tenant-backlog"), tbSeries,
+            {valueFmt: v => fmt(v, 0) + " 个排队事件"});
+
+  const pcts = ["mean", "p50", "p95", "p99", "max"];
+  const latGroups = pcts.map(p => ({
+    label: p,
+    values: [naive.metrics.latency_ms[p], smart.metrics.latency_ms[p]],
+  }));
+  barChart(document.getElementById("latencyChart"),
+           document.getElementById("tt-latency"), latGroups,
+           [{label: "naive-fifo", color: C.naive},
+            {label: "smart", color: C.smart}],
+           {valueFmt: v => v.toFixed(2) + " ms"});
+
+  const tenantNames = Object.keys(smart.metrics.tenant_latency_ms).sort();
+  const fairGroups = tenantNames.map(t => ({
+    label: t,
+    values: [
+      naive.metrics.tenant_latency_ms[t]?.p95 ?? 0,
+      smart.metrics.tenant_latency_ms[t]?.p95 ?? 0,
+    ],
+  }));
+  barChart(document.getElementById("fairnessChart"),
+           document.getElementById("tt-fairness"), fairGroups,
+           [{label: "naive-fifo p95", color: C.naive},
+            {label: "smart p95", color: C.smart}],
+           {valueFmt: v => v.toFixed(2) + " ms"});
+}
+
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  if (!lastReport) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => renderReport(lastReport), 150);
+});
+</script>
+</body>
+</html>
